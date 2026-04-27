@@ -7,6 +7,8 @@ import peersim.transport.Transport;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.LinkedHashSet;
 
 /**
  * Protocole DHT anneau – Etapes 1 (join/leave), 2 (routing), 3 (storage).
@@ -56,6 +58,9 @@ public class DHTProtocol implements EDProtocol {
     /** Stockage local des données dont ce nœud est responsable ou réplica. */
     public Map<Long, String> storage;
 
+    /** Table de routage pour l'étape 4 (liens longs). */
+    public Set<Node> routingTable;
+
     /** PID du protocole de transport (nécessaire pour envoyer des messages). */
     private final int tid;
 
@@ -64,6 +69,7 @@ public class DHTProtocol implements EDProtocol {
         tid     = Configuration.getPid(prefix + "." + PAR_TRANSPORT);
         state   = State.OFFLINE;
         storage = new HashMap<>();
+        routingTable = new LinkedHashSet<>();
     }
 
     @Override
@@ -75,6 +81,7 @@ public class DHTProtocol implements EDProtocol {
             clone.leftNeighbor  = null;
             clone.rightNeighbor = null;
             clone.storage       = new HashMap<>();
+            clone.routingTable  = new LinkedHashSet<>();
             return clone;
         } catch (CloneNotSupportedException e) {
             throw new RuntimeException(e);
@@ -91,6 +98,15 @@ public class DHTProtocol implements EDProtocol {
         // Un nœud OFFLINE n'accepte que JOIN_ACK (sa réponse de join en attente).
         // Tout autre message en transit vers un nœud parti est simplement ignoré.
         if (state == State.OFFLINE && msg.type != DHTMessage.Type.JOIN_ACK) return;
+
+        // --- Etape 4 : Piggybacking ---
+        if (msg.sender != null && msg.sender != node) routingTable.add(msg.sender);
+        if (msg.previousHop != null && msg.previousHop != node) routingTable.add(msg.previousHop);
+        if (routingTable.size() > 20) {
+            routingTable.remove(routingTable.iterator().next()); // LRU simple
+        }
+        // ------------------------------
+
         switch (msg.type) {
             case JOIN_REQ:  handleJoinReq(node, pid, msg);   break;
             case JOIN_ACK:  handleJoinAck(node, pid, msg);   break;
@@ -120,11 +136,15 @@ public class DHTProtocol implements EDProtocol {
                     node,          this.nodeId,       // left = moi
                     rightNeighbor, rightProto.nodeId  // right = mon ancien right
             );
+            ack.previousHop = node;
+            ack.previousHopId = nodeId;
             t.send(node, msg.sender, ack, pid);
         } else {
-            // On relaie vers la droite
+            // On relaie vers la droite ou via un lien long
             Transport t = (Transport) node.getProtocol(tid);
-            t.send(node, rightNeighbor, msg, pid);
+            msg.previousHop = node;
+            msg.previousHopId = nodeId;
+            t.send(node, getBestNextHop(msg.senderId, pid), msg, pid);
         }
     }
 
@@ -156,6 +176,15 @@ public class DHTProtocol implements EDProtocol {
 
         leftProto.rightNeighbor = node;
         rightProto.leftNeighbor = node;
+
+        // Etape 4 : "En trichant" - On ajoute quelques nœuds de l'anneau à notre table
+        for (int i = 0; i < 5; i++) {
+            Node randNode = peersim.core.Network.get(peersim.core.CommonState.r.nextInt(peersim.core.Network.size()));
+            DHTProtocol randP = (DHTProtocol) randNode.getProtocol(pid);
+            if (randP.state == State.ONLINE && randNode != node) {
+                routingTable.add(randNode);
+            }
+        }
 
         // Migration au join : le voisin droit cède les clés dont ce nœud
         // est maintenant responsable (range (left.id, nodeId] retiré à rightNeighbor).
@@ -202,12 +231,12 @@ public class DHTProtocol implements EDProtocol {
             return;
         }
 
-        // Relayage vers le voisin de droite
-        DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
+        // Relayage via le meilleur lien long (ou voisin de droite par défaut)
+        Node nextHop = getBestNextHop(msg.targetId, pid);
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] [FORWARD] at=" + nodeId
                 + " hop=" + (msg.hopCount + 1)
-                + " next=" + rightProto.nodeId
+                + " next=" + getIdOf(nextHop, pid)
                 + " target=" + msg.targetId);
 
         DHTMessage fwd = new DHTMessage(
@@ -215,8 +244,10 @@ public class DHTProtocol implements EDProtocol {
                 msg.sender, msg.senderId,
                 null, msg.targetId,
                 msg.payload, msg.hopCount + 1);
+        fwd.previousHop = node;
+        fwd.previousHopId = nodeId;
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, fwd, pid);
+        t.send(node, nextHop, fwd, pid);
     }
 
     // --------------------------------------------------- handlers étape 3
@@ -247,13 +278,15 @@ public class DHTProtocol implements EDProtocol {
             t.send(node, leftNeighbor,  rep, pid);
             t.send(node, rightNeighbor, rep, pid);
         } else {
-            // Relayer vers la droite
+            // Relayer vers la droite (ou le meilleur prochain saut)
             DHTMessage fwd = new DHTMessage(
                     DHTMessage.Type.PUT_REQ,
                     msg.sender, msg.senderId,
                     msg.key, msg.value, msg.hopCount + 1);
+            fwd.previousHop = node;
+            fwd.previousHopId = nodeId;
             Transport t = (Transport) node.getProtocol(tid);
-            t.send(node, rightNeighbor, fwd, pid);
+            t.send(node, getBestNextHop(msg.key, pid), fwd, pid);
         }
     }
 
@@ -290,8 +323,10 @@ public class DHTProtocol implements EDProtocol {
                     DHTMessage.Type.GET_REQ,
                     msg.sender, msg.senderId,
                     msg.key, null, msg.hopCount + 1);
+            fwd.previousHop = node;
+            fwd.previousHopId = nodeId;
             Transport t = (Transport) node.getProtocol(tid);
-            t.send(node, rightNeighbor, fwd, pid);
+            t.send(node, getBestNextHop(msg.key, pid), fwd, pid);
         }
     }
 
@@ -322,8 +357,10 @@ public class DHTProtocol implements EDProtocol {
                 msg.sender, msg.senderId,
                 msg.target, msg.targetId,
                 msg.key, msg.value, msg.hopCount + 1);
+        fwd.previousHop = node;
+        fwd.previousHopId = nodeId;
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, fwd, pid);
+        t.send(node, getBestNextHop(msg.targetId, pid), fwd, pid);
     }
 
     /**
@@ -361,8 +398,10 @@ public class DHTProtocol implements EDProtocol {
                 node, nodeId,
                 null, targetId,
                 payload, 0);
+        msg.previousHop = node;
+        msg.previousHopId = nodeId;
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, getBestNextHop(targetId, pid), msg, pid);
     }
 
     /**
@@ -388,8 +427,10 @@ public class DHTProtocol implements EDProtocol {
         }
 
         DHTMessage msg = new DHTMessage(DHTMessage.Type.PUT_REQ, node, nodeId, key, value, 0);
+        msg.previousHop = node;
+        msg.previousHopId = nodeId;
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, getBestNextHop(key, pid), msg, pid);
     }
 
     /**
@@ -410,8 +451,10 @@ public class DHTProtocol implements EDProtocol {
         }
 
         DHTMessage msg = new DHTMessage(DHTMessage.Type.GET_REQ, node, nodeId, key, null, 0);
+        msg.previousHop = node;
+        msg.previousHopId = nodeId;
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, getBestNextHop(key, pid), msg, pid);
     }
 
     /**
@@ -457,6 +500,38 @@ public class DHTProtocol implements EDProtocol {
     }
 
     // ------------------------------------------------------- méthodes utilitaires
+
+    /**
+     * Etape 4 : Sélectionne le meilleur prochain saut (le plus proche de targetId)
+     * parmi le voisin de droite et la table de routage.
+     */
+    private Node getBestNextHop(long targetId, int pid) {
+        Node bestNode = rightNeighbor;
+        long minDist = distance(getIdOf(rightNeighbor, pid), targetId);
+
+        for (Node n : routingTable) {
+            DHTProtocol p = (DHTProtocol) n.getProtocol(pid);
+            if (p.nodeId == this.nodeId || p.state != State.ONLINE) continue;
+
+            // Le nœud doit être strictement entre moi et la cible
+            if (isBetween(p.nodeId, this.nodeId, targetId)) {
+                long d = distance(p.nodeId, targetId);
+                if (d < minDist) {
+                    minDist = d;
+                    bestNode = n;
+                }
+            }
+        }
+        return bestNode;
+    }
+
+    /**
+     * Calcule la distance logique entre a et b dans le sens horaire.
+     */
+    private long distance(long a, long b) {
+        if (b >= a) return b - a;
+        return Long.MAX_VALUE - a + b + 1;
+    }
 
     /**
      * Retourne vrai si ce nœud est le responsable de la clé donnée.

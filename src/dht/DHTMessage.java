@@ -26,6 +26,10 @@ public class DHTMessage {
     public final Node   sender;
     public final long   senderId;
 
+    /** Nœud précédent dans le routage (pour piggybacking). */
+    public Node         previousHop;
+    public long         previousHopId;
+
     /** Nœud cible : JOIN_ACK (ancien right), GET_RESP (source à rembourser). */
     public final Node   target;
     /** ID cible  : JOIN_ACK, ROUTE, GET_RESP (ID de la source pour le retour). */

@@ -47,7 +47,6 @@ public class DHTObserver implements Control {
     }
 
     private void verifyRing(int expectedOnline) {
-        // Trouver un nœud de départ ONLINE
         Node start = null;
         for (int i = 0; i < Network.size(); i++) {
             Node n = Network.get(i);
@@ -58,26 +57,35 @@ public class DHTObserver implements Control {
         }
         if (start == null) { System.out.println("  (aucun nœud en ligne)"); return; }
 
-        // Parcours de l'anneau vers la droite
-        StringBuilder sb    = new StringBuilder("  Anneau : ");
-        Node          cur   = start;
-        int           count = 0;
-        boolean       valid = true;
-        long          prevId = -1;
+        StringBuilder sb        = new StringBuilder("  Anneau : ");
+        Node          cur       = start;
+        int           count     = 0;
+        int           wrapCount = 0;   // nombre de descentes d'ID (doit être exactement 1)
+        boolean       valid     = true;
+        long          prevId    = -1;
 
         do {
             DHTProtocol proto = (DHTProtocol) cur.getProtocol(pid);
 
+            // Vérification 1 : le nœud traversé doit être ONLINE
             if (proto.state != DHTProtocol.State.ONLINE) {
                 System.out.println("  ERREUR : nœud OFFLINE dans l'anneau (id=" + proto.nodeId + ")");
                 valid = false;
                 break;
             }
 
-            // Vérification de l'ordre (sauf wrap-around)
+            // Vérification 2 : cohérence bidirectionnelle (right.left == this)
+            DHTProtocol rightProto = (DHTProtocol) proto.rightNeighbor.getProtocol(pid);
+            if (rightProto.leftNeighbor != cur) {
+                System.out.println("  ERREUR : incohérence bidirectionnelle au nœud id="
+                        + proto.nodeId + " (right.left != this)");
+                valid = false;
+                break;
+            }
+
+            // Vérification 3 : comptage des wrap-arounds (descentes d'ID)
             if (prevId >= 0 && proto.nodeId < prevId) {
-                // Peut être un wrap-around légitime (une seule fois autorisée)
-                // On ne le signale pas comme erreur ici, le count suffit.
+                wrapCount++;
             }
             prevId = proto.nodeId;
 
@@ -93,15 +101,20 @@ public class DHTObserver implements Control {
             cur = proto.rightNeighbor;
         } while (cur != start);
 
-        if (valid) {
-            sb.append("(retour)");
-            System.out.println(sb);
-            if (count != expectedOnline) {
-                System.out.println("  AVERTISSEMENT : l'anneau contient " + count
-                        + " nœuds mais " + expectedOnline + " sont marqués ONLINE.");
-            } else {
-                System.out.println("  Intégrité OK : " + count + " nœuds dans l'anneau.");
-            }
+        if (!valid) return;
+
+        sb.append("(retour)");
+        System.out.println(sb);
+
+        // Un seul wrap-around attendu (la coupure de l'anneau circulaire)
+        if (wrapCount > 1) {
+            System.out.println("  ERREUR : ordre des IDs non respecté (" + wrapCount + " inversions)");
+        } else if (count != expectedOnline) {
+            System.out.println("  ERREUR : " + count + " nœuds dans l'anneau mais "
+                    + expectedOnline + " marqués ONLINE.");
+        } else {
+            System.out.println("  Intégrité OK : " + count + " nœuds, ordre correct, "
+                    + "pointeurs bidirectionnels cohérents.");
         }
     }
 }

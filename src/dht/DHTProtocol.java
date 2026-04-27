@@ -18,14 +18,13 @@ import peersim.transport.Transport;
  *     voisin de droite. Si oui → JOIN_ACK. Sinon → retransmet vers la droite.
  *  3. N reçoit JOIN_ACK(left=L, right=R) :
  *       - fixe ses voisins : left=L, right=R
+ *       - met à jour L.right = N et R.left = N (synchrone)
  *       - passe ONLINE
- *       - envoie UPDATE_RIGHT à L  (L doit mettre à jour son right vers N)
- *       - envoie UPDATE_LEFT  à R  (R doit mettre à jour son left  vers N)
  *
- * Protocole de LEAVE :
- *  1. N (ONLINE) envoie LEAVE_NOTIFY à son left  avec target = son right.
- *  2. N envoie LEAVE_NOTIFY à son right avec target = son left.
- *  3. N passe OFFLINE immédiatement.
+ * Protocole de LEAVE (synchrone) :
+ *  1. N met à jour directement leftNeighbor.right = rightNeighbor
+ *  2. N met à jour directement rightNeighbor.left = leftNeighbor
+ *  3. N passe OFFLINE
  */
 public class DHTProtocol implements EDProtocol {
 
@@ -75,18 +74,9 @@ public class DHTProtocol implements EDProtocol {
         // Tout autre message en transit vers un nœud parti est simplement ignoré.
         if (state == State.OFFLINE && msg.type != DHTMessage.Type.JOIN_ACK) return;
         switch (msg.type) {
-            case JOIN_REQ:      handleJoinReq(node, pid, msg);    break;
-            case JOIN_ACK:      handleJoinAck(node, pid, msg);    break;
-            case UPDATE_RIGHT:
-                // Ignorer si la cible est déjà partie
-                if (((DHTProtocol) msg.target.getProtocol(pid)).state == State.ONLINE)
-                    rightNeighbor = msg.target;
-                break;
-            case UPDATE_LEFT:
-                if (((DHTProtocol) msg.target.getProtocol(pid)).state == State.ONLINE)
-                    leftNeighbor = msg.target;
-                break;
-            case LEAVE_NOTIFY:  handleLeaveNotify(node, pid, msg);break;
+            case JOIN_REQ: handleJoinReq(node, pid, msg); break;
+            case JOIN_ACK: handleJoinAck(node, pid, msg); break;
+            default: break;
         }
     }
 
@@ -139,19 +129,6 @@ public class DHTProtocol implements EDProtocol {
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] Node " + nodeId + " joined. left=" + getIdOf(leftNeighbor, pid)
                 + " right=" + getIdOf(rightNeighbor, pid));
-    }
-
-    /**
-     * Un voisin nous notifie qu'il part.
-     * msg.sender = nœud qui part
-     * msg.target = le nœud avec lequel on doit se connecter à la place
-     */
-    private void handleLeaveNotify(Node node, int pid, DHTMessage msg) {
-        if (rightNeighbor == msg.sender) {
-            rightNeighbor = msg.target;
-        } else if (leftNeighbor == msg.sender) {
-            leftNeighbor = msg.target;
-        }
     }
 
     // ------------------------------------------------------------ API publique

@@ -6,20 +6,15 @@ import peersim.core.Node;
  * Messages échangés dans la DHT anneau.
  *
  * Types :
- *   JOIN_REQ      – un nœud offline demande à rejoindre l'anneau
- *   JOIN_ACK      – réponse : "insère-toi entre moi (sender) et target (mon ancien right)"
- *   UPDATE_RIGHT  – "mets à jour ton voisin de droite avec target"
- *   UPDATE_LEFT   – "mets à jour ton voisin de gauche avec target"
- *   LEAVE_NOTIFY  – "je pars, ton nouveau voisin est target"
+ *   JOIN_REQ – un nœud offline demande à rejoindre l'anneau ; relayé de droite
+ *              en droite jusqu'à trouver la bonne position
+ *   JOIN_ACK – réponse : "insère-toi entre moi (sender) et target (mon ancien right)"
  */
 public class DHTMessage {
 
     public enum Type {
         JOIN_REQ,
-        JOIN_ACK,
-        UPDATE_RIGHT,
-        UPDATE_LEFT,
-        LEAVE_NOTIFY
+        JOIN_ACK
     }
 
     public final Type type;

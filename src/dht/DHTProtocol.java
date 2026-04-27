@@ -157,9 +157,20 @@ public class DHTProtocol implements EDProtocol {
         leftProto.rightNeighbor = node;
         rightProto.leftNeighbor = node;
 
+        // Migration au join : le voisin droit cède les clés dont ce nœud
+        // est maintenant responsable (range (left.id, nodeId] retiré à rightNeighbor).
+        int inherited = 0;
+        for (Map.Entry<Long, String> entry : rightProto.storage.entrySet()) {
+            if (isResponsibleStatic(entry.getKey(), leftProto.nodeId, this.nodeId)) {
+                this.storage.putIfAbsent(entry.getKey(), entry.getValue());
+                inherited++;
+            }
+        }
+
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] Node " + nodeId + " joined. left=" + getIdOf(leftNeighbor, pid)
-                + " right=" + getIdOf(rightNeighbor, pid));
+                + " right=" + getIdOf(rightNeighbor, pid)
+                + (inherited > 0 ? " inherited=" + inherited + " keys" : ""));
     }
 
     /**
@@ -420,17 +431,29 @@ public class DHTProtocol implements EDProtocol {
         DHTProtocol leftProto  = (DHTProtocol) leftNeighbor.getProtocol(pid);
         DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
 
+        // Transfert du storage au successeur (voisin droit) avant de partir.
+        // Le voisin droit devient responsable de toutes les clés de ce nœud ;
+        // on lui donne les données qu'il ne possède pas encore.
+        int transferred = 0;
+        for (Map.Entry<Long, String> entry : storage.entrySet()) {
+            if (rightProto.storage.putIfAbsent(entry.getKey(), entry.getValue()) == null) {
+                transferred++;
+            }
+        }
+
         // Mise à jour synchrone : pont direct entre les deux voisins
         leftProto.rightNeighbor  = this.rightNeighbor;
         rightProto.leftNeighbor  = this.leftNeighbor;
 
         System.out.println("[t=" + peersim.core.CommonState.getTime()
-                + "] Node " + nodeId + " leaving. "
-                + leftProto.nodeId + " <-> " + rightProto.nodeId);
+                + "] Node " + nodeId + " leaving. transferred=" + transferred
+                + " entries to " + rightProto.nodeId
+                + " | " + leftProto.nodeId + " <-> " + rightProto.nodeId);
 
         state         = State.OFFLINE;
         leftNeighbor  = null;
         rightNeighbor = null;
+        storage       = new HashMap<>();
     }
 
     // ------------------------------------------------------- méthodes utilitaires
@@ -451,6 +474,13 @@ public class DHTProtocol implements EDProtocol {
         if (leftId == nodeId) return true;           // anneau mono-nœud
         if (leftId < nodeId)  return key > leftId && key <= nodeId;
         return key > leftId || key <= nodeId;        // wrap-around
+    }
+
+    /** Version statique de isResponsible, utilisée lors du join. */
+    private static boolean isResponsibleStatic(long key, long leftId, long myId) {
+        if (leftId == myId) return true;
+        if (leftId < myId)  return key > leftId && key <= myId;
+        return key > leftId || key <= myId;
     }
 
     /**

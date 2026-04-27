@@ -6,7 +6,7 @@ import peersim.edsim.EDProtocol;
 import peersim.transport.Transport;
 
 /**
- * Protocole DHT anneau – Etape 1 (join / leave).
+ * Protocole DHT anneau – Etapes 1 (join/leave) et 2 (routing).
  *
  * Chaque nœud connait uniquement ses deux voisins immédiats (gauche et droite).
  * Les identifiants sont des longs positifs aléatoires ; les nœuds sont ordonnés
@@ -76,7 +76,7 @@ public class DHTProtocol implements EDProtocol {
         switch (msg.type) {
             case JOIN_REQ: handleJoinReq(node, pid, msg); break;
             case JOIN_ACK: handleJoinAck(node, pid, msg); break;
-            default: break;
+            case ROUTE:    handleRoute(node, pid, msg);   break;
         }
     }
 
@@ -116,22 +116,103 @@ public class DHTProtocol implements EDProtocol {
      * immédiatement cohérent après insertion.
      */
     private void handleJoinAck(Node node, int pid, DHTMessage msg) {
+        DHTProtocol leftProto  = (DHTProtocol) msg.sender.getProtocol(pid);
+        DHTProtocol rightProto = (DHTProtocol) msg.target.getProtocol(pid);
+
+        // Vérification de cohérence : si un autre nœud s'est inséré entre left et right
+        // depuis l'envoi du JOIN_ACK, on relance la recherche depuis left.
+        if (leftProto.rightNeighbor != msg.target) {
+            Transport t = (Transport) node.getProtocol(tid);
+            DHTMessage retry = new DHTMessage(DHTMessage.Type.JOIN_REQ, node, nodeId, null, 0);
+            t.send(node, msg.sender, retry, pid);
+            return;
+        }
+
         this.leftNeighbor  = msg.sender;
         this.rightNeighbor = msg.target;
         this.state         = State.ONLINE;
 
-        // Mise à jour synchrone des pointeurs des voisins
-        DHTProtocol leftProto  = (DHTProtocol) leftNeighbor.getProtocol(pid);
-        DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
-        leftProto.rightNeighbor  = node;
-        rightProto.leftNeighbor  = node;
+        leftProto.rightNeighbor = node;
+        rightProto.leftNeighbor = node;
 
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] Node " + nodeId + " joined. left=" + getIdOf(leftNeighbor, pid)
                 + " right=" + getIdOf(rightNeighbor, pid));
     }
 
+    /**
+     * Routage d'un message applicatif (étape 2).
+     *
+     * Algorithme : on relaie vers le voisin de droite jusqu'à tomber sur le
+     * nœud dont l'ID correspond exactement à targetId (O(n) dans l'anneau).
+     * Si hopCount dépasse la taille du réseau, le message est abandonné
+     * (la destination a probablement quitté l'anneau entre-temps).
+     */
+    private void handleRoute(Node node, int pid, DHTMessage msg) {
+        if (msg.targetId == this.nodeId) {
+            // Ce nœud est la destination : livraison finale
+            System.out.println("[t=" + peersim.core.CommonState.getTime()
+                    + "] [DELIVER] dest=" + nodeId
+                    + " from=" + msg.senderId
+                    + " payload='" + msg.payload + "'"
+                    + " hops=" + msg.hopCount);
+            return;
+        }
+
+        // Sécurité : si le message a déjà fait plus de tours que de nœuds dans le
+        // réseau, la destination est introuvable (nœud parti depuis l'envoi)
+        if (msg.hopCount >= peersim.core.Network.size()) {
+            System.out.println("[t=" + peersim.core.CommonState.getTime()
+                    + "] [DROP] target=" + msg.targetId
+                    + " introuvable après " + msg.hopCount + " sauts"
+                    + " (dernier nœud=" + nodeId + ")");
+            return;
+        }
+
+        // Relayage vers le voisin de droite
+        DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
+        System.out.println("[t=" + peersim.core.CommonState.getTime()
+                + "] [FORWARD] at=" + nodeId
+                + " hop=" + (msg.hopCount + 1)
+                + " next=" + rightProto.nodeId
+                + " target=" + msg.targetId);
+
+        DHTMessage fwd = new DHTMessage(
+                DHTMessage.Type.ROUTE,
+                msg.sender, msg.senderId,
+                null, msg.targetId,
+                msg.payload, msg.hopCount + 1);
+        Transport t = (Transport) node.getProtocol(tid);
+        t.send(node, rightNeighbor, fwd, pid);
+    }
+
     // ------------------------------------------------------------ API publique
+
+    /**
+     * Envoie un message applicatif vers le nœud ayant l'identifiant targetId.
+     * Appelé depuis MessageSenderControl.
+     */
+    public void sendMessage(Node node, int pid, long targetId, String payload) {
+        System.out.println("[t=" + peersim.core.CommonState.getTime()
+                + "] [SEND] from=" + nodeId
+                + " to=" + targetId
+                + " payload='" + payload + "'");
+
+        if (targetId == this.nodeId) {
+            // Livraison locale (la source est aussi la destination)
+            System.out.println("[t=" + peersim.core.CommonState.getTime()
+                    + "] [DELIVER] dest=" + nodeId + " (local) hops=0");
+            return;
+        }
+
+        DHTMessage msg = new DHTMessage(
+                DHTMessage.Type.ROUTE,
+                node, nodeId,
+                null, targetId,
+                payload, 0);
+        Transport t = (Transport) node.getProtocol(tid);
+        t.send(node, rightNeighbor, msg, pid);
+    }
 
     /**
      * Déclenche la procédure de départ de ce nœud.

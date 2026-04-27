@@ -9,54 +9,38 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Protocole DHT anneau – Etapes 1 (join/leave), 2 (routing), 3 (storage).
+ * Protocole DHT anneau – Etapes 1 à 4.
  *
- * Chaque nœud connait uniquement ses deux voisins immédiats (gauche et droite).
- * Les identifiants sont des longs positifs aléatoires ; les nœuds sont ordonnés
- * par identifiant dans l'anneau.
- *
- * Protocole de JOIN (event-driven) :
- *  1. Le nœud N (OFFLINE) envoie JOIN_REQ à un nœud contact quelconque.
- *  2. Chaque nœud reçoit JOIN_REQ et vérifie si N se place entre lui et son
- *     voisin de droite. Si oui → JOIN_ACK. Sinon → retransmet vers la droite.
- *  3. N reçoit JOIN_ACK(left=L, right=R) :
- *       - fixe ses voisins : left=L, right=R
- *       - met à jour L.right = N et R.left = N (synchrone)
- *       - passe ONLINE
- *
- * Protocole de LEAVE (synchrone) :
- *  1. N met à jour directement leftNeighbor.right = rightNeighbor
- *  2. N met à jour directement rightNeighbor.left = leftNeighbor
- *  3. N passe OFFLINE
- *
- * Protocole de stockage (étape 3) :
- *  - Chaque nœud possède une HashMap<Long, String> storage.
- *  - Le nœud responsable d'une clé k est celui dont l'ID est le successeur
- *    immédiat de k dans l'anneau (premier nœud avec nodeId >= k, mod anneau).
- *  - Degré de réplication = 3 : responsable + voisin gauche + voisin droit.
- *  - PUT_REQ est relayé vers la droite jusqu'au responsable, qui stocke puis
- *    envoie REPLICATE à ses deux voisins immédiats.
- *  - GET_REQ est relayé vers la droite jusqu'au responsable, qui répond avec
- *    GET_RESP routé en sens inverse vers le demandeur.
+ * Etape 4 (routage avancé – méthode triche) :
+ *   Chaque nœud maintient une finger table de FINGER_BITS entrées.
+ *   finger[i] = premier nœud ONLINE dont l'ID >= (nodeId + 2^i) mod 2^63.
+ *   La table est construite par FingerTableControl qui accède directement à
+ *   Network.get(i) — vue globale du simulateur = la "triche".
+ *   Le routage utilise bestNextHop() : plus grand saut sans dépasser la cible,
+ *   ce qui réduit la complexité de O(n) à O(log n) sauts.
  */
 public class DHTProtocol implements EDProtocol {
 
     // ------------------------------------------------------------------ config
     private static final String PAR_TRANSPORT = "transport";
 
+    /** Nombre de bits dans l'espace d'IDs (IDs positifs sur 63 bits). */
+    public static final int FINGER_BITS = 63;
+
     // ------------------------------------------------------------------ état
     public enum State { OFFLINE, ONLINE }
 
-    /** Identifiant unique du nœud dans l'anneau (long positif). */
     public long  nodeId;
     public Node  leftNeighbor;
     public Node  rightNeighbor;
     public State state;
 
+    /** Finger table : finger[i] = successeur de (nodeId + 2^i) mod 2^63. */
+    public Node[] fingers;
+
     /** Stockage local des données dont ce nœud est responsable ou réplica. */
     public Map<Long, String> storage;
 
-    /** PID du protocole de transport (nécessaire pour envoyer des messages). */
     private final int tid;
 
     // ---------------------------------------------------------------- création
@@ -64,6 +48,7 @@ public class DHTProtocol implements EDProtocol {
         tid     = Configuration.getPid(prefix + "." + PAR_TRANSPORT);
         state   = State.OFFLINE;
         storage = new HashMap<>();
+        fingers = new Node[FINGER_BITS];
     }
 
     @Override
@@ -75,21 +60,19 @@ public class DHTProtocol implements EDProtocol {
             clone.leftNeighbor  = null;
             clone.rightNeighbor = null;
             clone.storage       = new HashMap<>();
+            clone.fingers       = new Node[FINGER_BITS];
             return clone;
         } catch (CloneNotSupportedException e) {
             throw new RuntimeException(e);
         }
     }
 
-    // ---------------------------------------------------------- accesseur util
     public int getTransportId() { return tid; }
 
     // ---------------------------------------------------- point d'entrée ED
     @Override
     public void processEvent(Node node, int pid, Object event) {
         DHTMessage msg = (DHTMessage) event;
-        // Un nœud OFFLINE n'accepte que JOIN_ACK (sa réponse de join en attente).
-        // Tout autre message en transit vers un nœud parti est simplement ignoré.
         if (state == State.OFFLINE && msg.type != DHTMessage.Type.JOIN_ACK) return;
         switch (msg.type) {
             case JOIN_REQ:  handleJoinReq(node, pid, msg);   break;
@@ -102,47 +85,27 @@ public class DHTProtocol implements EDProtocol {
         }
     }
 
-    // -------------------------------------------------- handlers individuels
+    // -------------------------------------------------- handlers join/leave
 
-    /**
-     * Ce nœud reçoit une demande de JOIN (ou un relai de JOIN).
-     * Il vérifie si le nœud demandeur se place entre lui et son right.
-     * Si oui → il répond. Sinon → il relaie vers son right.
-     */
     private void handleJoinReq(Node node, int pid, DHTMessage msg) {
         DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
-
         if (isBetween(msg.senderId, this.nodeId, rightProto.nodeId)) {
-            // Le nœud se place entre this et rightNeighbor → on répond
             Transport t = (Transport) node.getProtocol(tid);
             DHTMessage ack = new DHTMessage(
                     DHTMessage.Type.JOIN_ACK,
-                    node,          this.nodeId,       // left = moi
-                    rightNeighbor, rightProto.nodeId  // right = mon ancien right
-            );
+                    node, this.nodeId,
+                    rightNeighbor, rightProto.nodeId);
             t.send(node, msg.sender, ack, pid);
         } else {
-            // On relaie vers la droite
             Transport t = (Transport) node.getProtocol(tid);
             t.send(node, rightNeighbor, msg, pid);
         }
     }
 
-    /**
-     * Ce nœud (en attente de JOIN) reçoit la réponse.
-     * msg.sender  = futur voisin gauche
-     * msg.target  = futur voisin droite
-     *
-     * La découverte de la position est message-based (JOIN_REQ relayé dans l'anneau).
-     * La mise à jour finale des pointeurs est synchrone afin que l'anneau soit
-     * immédiatement cohérent après insertion.
-     */
     private void handleJoinAck(Node node, int pid, DHTMessage msg) {
         DHTProtocol leftProto  = (DHTProtocol) msg.sender.getProtocol(pid);
         DHTProtocol rightProto = (DHTProtocol) msg.target.getProtocol(pid);
 
-        // Vérification de cohérence : si un autre nœud s'est inséré entre left et right
-        // depuis l'envoi du JOIN_ACK, on relance la recherche depuis left.
         if (leftProto.rightNeighbor != msg.target) {
             Transport t = (Transport) node.getProtocol(tid);
             DHTMessage retry = new DHTMessage(DHTMessage.Type.JOIN_REQ, node, nodeId, null, 0);
@@ -157,8 +120,7 @@ public class DHTProtocol implements EDProtocol {
         leftProto.rightNeighbor = node;
         rightProto.leftNeighbor = node;
 
-        // Migration au join : le voisin droit cède les clés dont ce nœud
-        // est maintenant responsable (range (left.id, nodeId] retiré à rightNeighbor).
+        // Migration au join : le voisin droit cède les clés dont ce nœud est désormais responsable.
         int inherited = 0;
         for (Map.Entry<Long, String> entry : rightProto.storage.entrySet()) {
             if (isResponsibleStatic(entry.getKey(), leftProto.nodeId, this.nodeId)) {
@@ -173,17 +135,10 @@ public class DHTProtocol implements EDProtocol {
                 + (inherited > 0 ? " inherited=" + inherited + " keys" : ""));
     }
 
-    /**
-     * Routage d'un message applicatif (étape 2).
-     *
-     * Algorithme : on relaie vers le voisin de droite jusqu'à tomber sur le
-     * nœud dont l'ID correspond exactement à targetId (O(n) dans l'anneau).
-     * Si hopCount dépasse la taille du réseau, le message est abandonné
-     * (la destination a probablement quitté l'anneau entre-temps).
-     */
+    // -------------------------------------------------- handler routage (étape 2)
+
     private void handleRoute(Node node, int pid, DHTMessage msg) {
         if (msg.targetId == this.nodeId) {
-            // Ce nœud est la destination : livraison finale
             System.out.println("[t=" + peersim.core.CommonState.getTime()
                     + "] [DELIVER] dest=" + nodeId
                     + " from=" + msg.senderId
@@ -192,22 +147,19 @@ public class DHTProtocol implements EDProtocol {
             return;
         }
 
-        // Sécurité : si le message a déjà fait plus de tours que de nœuds dans le
-        // réseau, la destination est introuvable (nœud parti depuis l'envoi)
         if (msg.hopCount >= peersim.core.Network.size()) {
             System.out.println("[t=" + peersim.core.CommonState.getTime()
                     + "] [DROP] target=" + msg.targetId
-                    + " introuvable après " + msg.hopCount + " sauts"
-                    + " (dernier nœud=" + nodeId + ")");
+                    + " introuvable après " + msg.hopCount + " sauts");
             return;
         }
 
-        // Relayage vers le voisin de droite
-        DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
+        Node next   = bestNextHop(msg.targetId, pid);
+        long nextId = ((DHTProtocol) next.getProtocol(pid)).nodeId;
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] [FORWARD] at=" + nodeId
                 + " hop=" + (msg.hopCount + 1)
-                + " next=" + rightProto.nodeId
+                + " next=" + nextId
                 + " target=" + msg.targetId);
 
         DHTMessage fwd = new DHTMessage(
@@ -216,20 +168,15 @@ public class DHTProtocol implements EDProtocol {
                 null, msg.targetId,
                 msg.payload, msg.hopCount + 1);
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, fwd, pid);
+        t.send(node, next, fwd, pid);
     }
 
-    // --------------------------------------------------- handlers étape 3
+    // --------------------------------------------------- handlers stockage (étape 3)
 
-    /**
-     * Reçoit une requête PUT_REQ.
-     * Si ce nœud est responsable de la clé → stocke et réplique vers ses voisins.
-     * Sinon → relaie vers la droite.
-     */
     private void handlePutReq(Node node, int pid, DHTMessage msg) {
         if (msg.hopCount >= peersim.core.Network.size()) {
             System.out.println("[t=" + peersim.core.CommonState.getTime()
-                    + "] [PUT-DROP] key=" + msg.key + " introuvable après " + msg.hopCount + " sauts");
+                    + "] [PUT-DROP] key=" + msg.key + " après " + msg.hopCount + " sauts");
             return;
         }
 
@@ -239,33 +186,26 @@ public class DHTProtocol implements EDProtocol {
                     + "] [PUT-STORE] node=" + nodeId
                     + " key=" + msg.key + " value='" + msg.value + "'"
                     + " hops=" + msg.hopCount);
-
-            // Réplication vers le voisin gauche et le voisin droit
             Transport t = (Transport) node.getProtocol(tid);
             DHTMessage rep = new DHTMessage(
                     DHTMessage.Type.REPLICATE, node, nodeId, msg.key, msg.value, 0);
             t.send(node, leftNeighbor,  rep, pid);
             t.send(node, rightNeighbor, rep, pid);
         } else {
-            // Relayer vers la droite
+            Node next = bestNextHop(msg.key, pid);
             DHTMessage fwd = new DHTMessage(
                     DHTMessage.Type.PUT_REQ,
                     msg.sender, msg.senderId,
                     msg.key, msg.value, msg.hopCount + 1);
             Transport t = (Transport) node.getProtocol(tid);
-            t.send(node, rightNeighbor, fwd, pid);
+            t.send(node, next, fwd, pid);
         }
     }
 
-    /**
-     * Reçoit une requête GET_REQ.
-     * Si ce nœud est responsable → répond GET_RESP vers le demandeur.
-     * Sinon → relaie vers la droite.
-     */
     private void handleGetReq(Node node, int pid, DHTMessage msg) {
         if (msg.hopCount >= peersim.core.Network.size()) {
             System.out.println("[t=" + peersim.core.CommonState.getTime()
-                    + "] [GET-DROP] key=" + msg.key + " introuvable après " + msg.hopCount + " sauts");
+                    + "] [GET-DROP] key=" + msg.key + " après " + msg.hopCount + " sauts");
             return;
         }
 
@@ -276,8 +216,6 @@ public class DHTProtocol implements EDProtocol {
                     + " key=" + msg.key
                     + " value=" + (found != null ? "'" + found + "'" : "null")
                     + " hops=" + msg.hopCount);
-
-            // Répondre au demandeur (msg.sender) avec GET_RESP
             DHTMessage resp = new DHTMessage(
                     DHTMessage.Type.GET_RESP,
                     node, nodeId,
@@ -286,20 +224,16 @@ public class DHTProtocol implements EDProtocol {
             Transport t = (Transport) node.getProtocol(tid);
             t.send(node, msg.sender, resp, pid);
         } else {
+            Node next = bestNextHop(msg.key, pid);
             DHTMessage fwd = new DHTMessage(
                     DHTMessage.Type.GET_REQ,
                     msg.sender, msg.senderId,
                     msg.key, null, msg.hopCount + 1);
             Transport t = (Transport) node.getProtocol(tid);
-            t.send(node, rightNeighbor, fwd, pid);
+            t.send(node, next, fwd, pid);
         }
     }
 
-    /**
-     * Reçoit la réponse GET_RESP.
-     * Si ce nœud est le destinataire (targetId == nodeId) → livraison.
-     * Sinon → relaie vers la droite (le demandeur est quelque part dans l'anneau).
-     */
     private void handleGetResp(Node node, int pid, DHTMessage msg) {
         if (msg.targetId == this.nodeId) {
             System.out.println("[t=" + peersim.core.CommonState.getTime()
@@ -313,23 +247,20 @@ public class DHTProtocol implements EDProtocol {
         if (msg.hopCount >= peersim.core.Network.size()) {
             System.out.println("[t=" + peersim.core.CommonState.getTime()
                     + "] [GET-RESP-DROP] targetId=" + msg.targetId
-                    + " introuvable après " + msg.hopCount + " sauts");
+                    + " après " + msg.hopCount + " sauts");
             return;
         }
 
+        Node next = bestNextHop(msg.targetId, pid);
         DHTMessage fwd = new DHTMessage(
                 DHTMessage.Type.GET_RESP,
                 msg.sender, msg.senderId,
                 msg.target, msg.targetId,
                 msg.key, msg.value, msg.hopCount + 1);
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, fwd, pid);
+        t.send(node, next, fwd, pid);
     }
 
-    /**
-     * Reçoit un message de réplication directe.
-     * Stocke simplement la paire (key, value) localement.
-     */
     private void handleReplicate(Node node, int pid, DHTMessage msg) {
         storage.put(msg.key, msg.value);
         System.out.println("[t=" + peersim.core.CommonState.getTime()
@@ -339,63 +270,47 @@ public class DHTProtocol implements EDProtocol {
 
     // ------------------------------------------------------------ API publique
 
-    /**
-     * Envoie un message applicatif vers le nœud ayant l'identifiant targetId.
-     * Appelé depuis MessageSenderControl.
-     */
     public void sendMessage(Node node, int pid, long targetId, String payload) {
         System.out.println("[t=" + peersim.core.CommonState.getTime()
-                + "] [SEND] from=" + nodeId
-                + " to=" + targetId
+                + "] [SEND] from=" + nodeId + " to=" + targetId
                 + " payload='" + payload + "'");
 
         if (targetId == this.nodeId) {
-            // Livraison locale (la source est aussi la destination)
             System.out.println("[t=" + peersim.core.CommonState.getTime()
                     + "] [DELIVER] dest=" + nodeId + " (local) hops=0");
             return;
         }
 
+        Node next = bestNextHop(targetId, pid);
         DHTMessage msg = new DHTMessage(
-                DHTMessage.Type.ROUTE,
-                node, nodeId,
-                null, targetId,
-                payload, 0);
+                DHTMessage.Type.ROUTE, node, nodeId, null, targetId, payload, 0);
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, next, msg, pid);
     }
 
-    /**
-     * Initie un PUT vers la DHT : le message est relayé jusqu'au nœud responsable.
-     * Appelé depuis StorageTestControl.
-     */
     public void put(Node node, int pid, long key, String value) {
         System.out.println("[t=" + peersim.core.CommonState.getTime()
-                + "] [PUT] from=" + nodeId
-                + " key=" + key + " value='" + value + "'");
+                + "] [PUT] from=" + nodeId + " key=" + key + " value='" + value + "'");
 
         if (isResponsible(pid, key)) {
-            // Ce nœud est directement responsable
             storage.put(key, value);
             System.out.println("[t=" + peersim.core.CommonState.getTime()
                     + "] [PUT-STORE] node=" + nodeId
                     + " key=" + key + " value='" + value + "' hops=0");
             Transport t = (Transport) node.getProtocol(tid);
-            DHTMessage rep = new DHTMessage(DHTMessage.Type.REPLICATE, node, nodeId, key, value, 0);
+            DHTMessage rep = new DHTMessage(
+                    DHTMessage.Type.REPLICATE, node, nodeId, key, value, 0);
             t.send(node, leftNeighbor,  rep, pid);
             t.send(node, rightNeighbor, rep, pid);
             return;
         }
 
+        Node next = bestNextHop(key, pid);
         DHTMessage msg = new DHTMessage(DHTMessage.Type.PUT_REQ, node, nodeId, key, value, 0);
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, next, msg, pid);
     }
 
-    /**
-     * Initie un GET vers la DHT : le message est relayé jusqu'au nœud responsable.
-     * Appelé depuis StorageTestControl.
-     */
     public void get(Node node, int pid, long key) {
         System.out.println("[t=" + peersim.core.CommonState.getTime()
                 + "] [GET] from=" + nodeId + " key=" + key);
@@ -403,37 +318,24 @@ public class DHTProtocol implements EDProtocol {
         if (isResponsible(pid, key)) {
             String found = storage.get(key);
             System.out.println("[t=" + peersim.core.CommonState.getTime()
-                    + "] [GET-RESP] dest=" + nodeId + " (local)"
-                    + " key=" + key
+                    + "] [GET-RESP] dest=" + nodeId + " (local) key=" + key
                     + " value=" + (found != null ? "'" + found + "'" : "null"));
             return;
         }
 
+        Node next = bestNextHop(key, pid);
         DHTMessage msg = new DHTMessage(DHTMessage.Type.GET_REQ, node, nodeId, key, null, 0);
         Transport t = (Transport) node.getProtocol(tid);
-        t.send(node, rightNeighbor, msg, pid);
+        t.send(node, next, msg, pid);
     }
 
-    /**
-     * Déclenche la procédure de départ de ce nœud.
-     * Appelé depuis JoinLeaveControl.
-     *
-     * Note de conception : le départ est traité de façon synchrone (mise à jour
-     * directe des voisins) afin d'éviter les incohérences transitoires dues aux
-     * délais de transport. Dans un vrai système distribué, des messages LEAVE_NOTIFY
-     * seraient envoyés (le handler handleLeaveNotify est conservé à cet effet).
-     */
     public void leave(Node node, int pid) {
         if (state != State.ONLINE) return;
-        // On ne retire pas le dernier nœud de l'anneau
         if (leftNeighbor == node && rightNeighbor == node) return;
 
         DHTProtocol leftProto  = (DHTProtocol) leftNeighbor.getProtocol(pid);
         DHTProtocol rightProto = (DHTProtocol) rightNeighbor.getProtocol(pid);
 
-        // Transfert du storage au successeur (voisin droit) avant de partir.
-        // Le voisin droit devient responsable de toutes les clés de ce nœud ;
-        // on lui donne les données qu'il ne possède pas encore.
         int transferred = 0;
         for (Map.Entry<Long, String> entry : storage.entrySet()) {
             if (rightProto.storage.putIfAbsent(entry.getKey(), entry.getValue()) == null) {
@@ -441,7 +343,6 @@ public class DHTProtocol implements EDProtocol {
             }
         }
 
-        // Mise à jour synchrone : pont direct entre les deux voisins
         leftProto.rightNeighbor  = this.rightNeighbor;
         rightProto.leftNeighbor  = this.leftNeighbor;
 
@@ -459,42 +360,44 @@ public class DHTProtocol implements EDProtocol {
     // ------------------------------------------------------- méthodes utilitaires
 
     /**
-     * Retourne vrai si ce nœud est le responsable de la clé donnée.
+     * Sélectionne le meilleur prochain saut vers targetId.
      *
-     * Dans un anneau ordonné par ID croissant, le responsable d'une clé k est le
-     * premier nœud rencontré dans le sens horaire dont l'ID est >= k.
-     * En termes de voisinage : this est responsable si k ∈ (leftNeighbor.id, nodeId].
+     * Parcourt fingers de i=62 downto 0 (du plus grand saut au plus petit).
+     * Retourne le premier finger[i] dont l'ID est strictement entre (nodeId, targetId)
+     * dans l'espace circulaire — ou égal à targetId (livraison directe possible).
+     * Fallback : rightNeighbor (comportement naïf, O(n)).
      *
-     * Cas particulier : si leftNeighbor.id == nodeId (anneau mono-nœud), on est
-     * toujours responsable.
+     * Complexité résultante : O(log n) sauts.
      */
+    private Node bestNextHop(long targetId, int pid) {
+        for (int i = FINGER_BITS - 1; i >= 0; i--) {
+            if (fingers[i] == null) continue;
+            DHTProtocol fp = (DHTProtocol) fingers[i].getProtocol(pid);
+            if (fp.state != State.ONLINE) continue;
+            if (fp.nodeId == targetId || isBetween(fp.nodeId, this.nodeId, targetId))
+                return fingers[i];
+        }
+        return rightNeighbor;
+    }
+
     private boolean isResponsible(int pid, long key) {
         DHTProtocol leftProto = (DHTProtocol) leftNeighbor.getProtocol(pid);
         long leftId = leftProto.nodeId;
-        if (leftId == nodeId) return true;           // anneau mono-nœud
+        if (leftId == nodeId) return true;
         if (leftId < nodeId)  return key > leftId && key <= nodeId;
-        return key > leftId || key <= nodeId;        // wrap-around
+        return key > leftId || key <= nodeId;
     }
 
-    /** Version statique de isResponsible, utilisée lors du join. */
     private static boolean isResponsibleStatic(long key, long leftId, long myId) {
         if (leftId == myId) return true;
         if (leftId < myId)  return key > leftId && key <= myId;
         return key > leftId || key <= myId;
     }
 
-    /**
-     * Retourne vrai si newId se place strictement entre leftId et rightId
-     * dans un espace d'identifiants circulaire.
-     *
-     *  - Si leftId == rightId : anneau à un seul nœud → toujours vrai.
-     *  - Si leftId < rightId  : cas normal, newId ∈ ]leftId, rightId[.
-     *  - Sinon (wrap-around)  : newId > leftId OU newId < rightId.
-     */
     public static boolean isBetween(long newId, long leftId, long rightId) {
-        if (leftId == rightId) return true;        // anneau mono-nœud
+        if (leftId == rightId) return true;
         if (leftId < rightId)  return newId > leftId && newId < rightId;
-        return newId > leftId || newId < rightId;  // wrap-around
+        return newId > leftId || newId < rightId;
     }
 
     private long getIdOf(Node n, int pid) {

@@ -7,7 +7,7 @@ import peersim.core.Network;
 import peersim.core.Node;
 
 /**
- * Contrôleur de test pour l'étape 3 (storage : Put/Get).
+ * Contrôleur de test pour storage : Put/Get.
  *
  * Fonctionnement en deux phases :
  *
@@ -58,7 +58,7 @@ public class StorageTestControl implements Control {
         Node src = randomOnlineNode();
         if (src == null) return;
 
-        long key   = CommonState.r.nextLong() >>> 1;   // long positif
+        long key   = CommonState.r.nextLong() & ((1L << DHTProtocol.FINGER_BITS) - 1);
         String val = "val-" + key;
         keys[putCount] = key;
         putCount++;

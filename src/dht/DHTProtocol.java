@@ -9,7 +9,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Protocole DHT anneau – Etapes 1 à 4.
+ * Protocole DHT anneau .
  *
  * Etape 4 (routage avancé – méthode triche) :
  *   Chaque nœud maintient une finger table de FINGER_BITS entrées.
@@ -24,8 +24,8 @@ public class DHTProtocol implements EDProtocol {
     // ------------------------------------------------------------------ config
     private static final String PAR_TRANSPORT = "transport";
 
-    /** Nombre de bits dans l'espace d'IDs (IDs positifs sur 63 bits). */
-    public static final int FINGER_BITS = 63;
+    /** Nombre de bits dans l'espace d'IDs (IDs sur 16 bits, [0, 65535]). */
+    public static final int FINGER_BITS = 16;
 
     // ------------------------------------------------------------------ état
     public enum State { OFFLINE, ONLINE }

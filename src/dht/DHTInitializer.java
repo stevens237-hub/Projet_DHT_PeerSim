@@ -28,8 +28,8 @@ public class DHTInitializer implements Control {
         for (int i = 0; i < Network.size(); i++) {
             Node node = Network.get(i);
             DHTProtocol proto = (DHTProtocol) node.getProtocol(pid);
-            // Long positif (bit de signe mis à 0)
-            proto.nodeId = CommonState.r.nextLong() >>> 1;
+            // ID sur 16 bits : [0, 65535]
+            proto.nodeId = CommonState.r.nextLong() & ((1L << DHTProtocol.FINGER_BITS) - 1);
             proto.state  = DHTProtocol.State.OFFLINE;
         }
 

@@ -7,7 +7,7 @@ import peersim.core.Network;
 import peersim.core.Node;
 
 /**
- * Contrôleur de test pour l'étape 2 (routing).
+ * Contrôleur de test pour le routing.
  *
  * À chaque pas, sélectionne aléatoirement deux nœuds ONLINE (source et destination)
  * et envoie un message applicatif de l'un vers l'autre.

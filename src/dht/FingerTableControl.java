@@ -12,11 +12,6 @@ import peersim.core.Node;
  * À chaque exécution, parcourt tous les nœuds ONLINE du réseau et reconstruit
  * leur finger table en utilisant Network.get(i) — la vue globale du simulateur.
  *
- * C'est la "triche" : dans un vrai système distribué, un nœud ne peut pas
- * interroger directement tous ses pairs. Ici on exploite l'omniscience du
- * simulateur pour calculer finger[i] = successeur de (nodeId + 2^i) mod 2^63
- * sans échange de messages.
- *
  * Paramètres :
  *   protocol – pid du protocole DHT
  */
@@ -47,16 +42,11 @@ public class FingerTableControl implements Control {
     /**
      * Reconstruit la finger table du nœud node.
      *
-     * Pour chaque indice i ∈ [0, FINGER_BITS) :
-     *   target = (proto.nodeId + 2^i) mod 2^63
-     *   finger[i] = premier nœud ONLINE avec id >= target (circulaire)
-     *
      * La triche : on scanne directement Network.get(j) pour trouver ce nœud.
      */
     private void buildFingers(Node node, DHTProtocol proto) {
         for (int i = 0; i < DHTProtocol.FINGER_BITS; i++) {
-            // (nodeId + 2^i) mod 2^63 — & Long.MAX_VALUE maintient le résultat positif
-            long target = (proto.nodeId + (1L << i)) & Long.MAX_VALUE;
+            long target = (proto.nodeId + (1L << i)) & ((1L << DHTProtocol.FINGER_BITS) - 1);
             proto.fingers[i] = findOnlineSuccessor(target, node);
         }
     }
@@ -66,7 +56,6 @@ public class FingerTableControl implements Control {
      * Si aucun nœud n'a un ID >= target, retourne celui avec le plus petit ID (wrap-around).
      * Le nœud exclude (celui dont on construit la table) est ignoré.
      *
-     * Accès direct à Network.get(i) = la "triche".
      */
     private Node findOnlineSuccessor(long target, Node exclude) {
         Node bestDirect = null;   // id >= target (successeur direct)
